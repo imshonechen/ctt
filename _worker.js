@@ -378,19 +378,7 @@ export default {
         return;
       }
 
-      let userState = userStateCache.get(chatId);
-      if (userState === undefined) {
-        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        if (!userState) {
-          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
-          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
-            .bind(chatId, false, true, false, false)
-            .run();
-        }
-        userStateCache.set(chatId, userState);
-      }
+      let userState = await getOrCreateUserState(chatId);
 
       if (userState.is_blocked) {
         await sendMessageToUser(chatId, "您已被拉黑，无法发送消息。请联系管理员解除拉黑。");
@@ -602,12 +590,65 @@ export default {
       await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态和消息频率已重置，当前子话题将继续复用。`);
     }
 
+    function createDefaultUserState(overrides = {}) {
+      return {
+        is_blocked: false,
+        is_first_verification: true,
+        is_verified: false,
+        verified_expiry: null,
+        verification_code: null,
+        code_expiry: null,
+        last_verification_message_id: null,
+        is_verifying: false,
+        ...overrides
+      };
+    }
+
+    function hasCompleteUserState(state) {
+      return !!state
+        && typeof state.is_blocked !== 'undefined'
+        && typeof state.is_first_verification !== 'undefined'
+        && typeof state.is_verified !== 'undefined'
+        && Object.prototype.hasOwnProperty.call(state, 'verified_expiry')
+        && typeof state.is_verifying !== 'undefined';
+    }
+
+    async function getOrCreateUserState(chatId) {
+      let userState = userStateCache.get(chatId);
+      if (hasCompleteUserState(userState)) {
+        return createDefaultUserState(userState);
+      }
+
+      const storedState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_verifying FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+
+      if (!storedState) {
+        userState = createDefaultUserState();
+        await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_verifying) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .bind(chatId, false, true, false, null, null, null, null, false)
+          .run();
+      } else {
+        userState = createDefaultUserState(storedState);
+      }
+
+      userStateCache.set(chatId, userState);
+      return userState;
+    }
+
     async function resetUserState(targetChatId) {
+      const existingState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
+        .bind(targetChatId)
+        .first();
+      const isBlocked = existingState?.is_blocked === true || existingState?.is_blocked === 1;
+
+      const resetState = createDefaultUserState({ is_blocked: isBlocked });
       await env.D1.batch([
-        env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId),
+        env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_verifying) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .bind(targetChatId, resetState.is_blocked, resetState.is_first_verification, resetState.is_verified, resetState.verified_expiry, resetState.verification_code, resetState.code_expiry, resetState.last_verification_message_id, resetState.is_verifying),
         env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId)
       ]);
-      userStateCache.set(targetChatId, undefined);
+      userStateCache.set(targetChatId, resetState);
       messageRateCache.set(targetChatId, undefined);
     }
 
@@ -766,20 +807,21 @@ export default {
 
     async function getUserBlockedState(chatId) {
       let state = userStateCache.get(chatId);
-      if (state === undefined) {
-        state = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first() || { is_blocked: false };
-        userStateCache.set(chatId, state);
-      } else if (typeof state.is_blocked === 'undefined') {
+      if (state !== undefined && typeof state.is_blocked !== 'undefined') {
+        return state.is_blocked === true || state.is_blocked === 1;
+      } else if (state !== undefined) {
         const result = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
-        state = { ...state, is_blocked: result?.is_blocked || false };
+        state = createDefaultUserState({ ...(state || {}), is_blocked: result?.is_blocked || false });
         userStateCache.set(chatId, state);
+        return state.is_blocked === true || state.is_blocked === 1;
       }
 
-      return state.is_blocked === true || state.is_blocked === 1;
+      const result = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      return result?.is_blocked === true || result?.is_blocked === 1;
     }
 
     async function getSetting(key, d1) {
@@ -862,16 +904,7 @@ export default {
           return;
         }
 
-        let verificationState = userStateCache.get(chatId);
-        if (verificationState === undefined) {
-          verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          if (!verificationState) {
-            verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
-          }
-          userStateCache.set(chatId, verificationState);
-        }
+        let verificationState = await getOrCreateUserState(chatId);
 
         const storedCode = verificationState.verification_code;
         const codeExpiry = verificationState.code_expiry;
@@ -1045,16 +1078,7 @@ export default {
 
     async function handleVerification(chatId, messageId) {
       try {
-        let userState = userStateCache.get(chatId);
-        if (userState === undefined) {
-          userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          if (!userState) {
-            userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
-          }
-          userStateCache.set(chatId, userState);
-        }
+        let userState = await getOrCreateUserState(chatId);
 
         userState.verification_code = null;
         userState.code_expiry = null;
