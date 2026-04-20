@@ -213,6 +213,31 @@ export default {
       return text.replace(/^\/\S+\s*/, '').trim();
     }
 
+    function isAnonymousGroupAdminMessage(message) {
+      return message?.chat?.id?.toString() === GROUP_ID
+        && message?.sender_chat?.id?.toString() === GROUP_ID;
+    }
+
+    async function ensureAdminMessageAccess(message, topicId) {
+      if (isAnonymousGroupAdminMessage(message)) {
+        return true;
+      }
+
+      const senderId = message?.from?.id?.toString() || null;
+      if (!senderId) {
+        await sendMessageToTopic(topicId, '无法识别命令发送者，请关闭匿名管理员后重试。');
+        return false;
+      }
+
+      const isAdmin = await checkIfAdmin(senderId);
+      if (!isAdmin) {
+        await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
+        return false;
+      }
+
+      return true;
+    }
+
     async function checkAndRepairTables(d1) {
       const expectedTables = {
         user_states: {
@@ -377,7 +402,7 @@ export default {
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
           if (botCommand && ['/set_verify_mode', '/set_verify_question', '/set_verify_answer', '/show_verify_config'].includes(botCommand)) {
-            await handleVerificationConfigCommand(message.from?.id?.toString() || null, topicId, text, botCommand);
+            await handleVerificationConfigCommand(message, topicId, text, botCommand);
             return;
           }
           if (privateChatId && botCommand === '/admin') {
@@ -385,7 +410,7 @@ export default {
             return;
           }
           if (privateChatId && botCommand === '/reset_user') {
-            await handleResetUser(message.from?.id?.toString() || null, topicId, text);
+            await handleResetUser(message, topicId, text);
             return;
           }
           if (privateChatId && botCommand) {
@@ -594,14 +619,9 @@ export default {
       }
     }
 
-    async function handleResetUser(senderId, topicId, text) {
-      if (!senderId) {
-        await sendMessageToTopic(topicId, '无法识别命令发送者，请关闭匿名管理员后重试。');
-        return;
-      }
-      const isAdmin = await checkIfAdmin(senderId);
-      if (!isAdmin) {
-        await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
+    async function handleResetUser(message, topicId, text) {
+      const hasAdminAccess = await ensureAdminMessageAccess(message, topicId);
+      if (!hasAdminAccess) {
         return;
       }
 
@@ -616,15 +636,9 @@ export default {
       await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态和消息频率已重置，当前子话题将继续复用。`);
     }
 
-    async function handleVerificationConfigCommand(senderId, topicId, text, command) {
-      if (!senderId) {
-        await sendMessageToTopic(topicId, '无法识别命令发送者，请关闭匿名管理员后重试。');
-        return;
-      }
-
-      const isAdmin = await checkIfAdmin(senderId);
-      if (!isAdmin) {
-        await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
+    async function handleVerificationConfigCommand(message, topicId, text, command) {
+      const hasAdminAccess = await ensureAdminMessageAccess(message, topicId);
+      if (!hasAdminAccess) {
         return;
       }
 
