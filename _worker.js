@@ -14,7 +14,10 @@ const topicCreationLocks = new Map();
 
 const settingsCache = new Map([
   ['verification_enabled', null],
-  ['user_raw_enabled', null]
+  ['user_raw_enabled', null],
+  ['verification_mode', null],
+  ['custom_verification_question', null],
+  ['custom_verification_answer', null]
 ]);
 
 class LRUCache {
@@ -206,6 +209,10 @@ export default {
       return `/${commandName.toLowerCase()}`;
     }
 
+    function extractCommandPayload(text) {
+      return text.replace(/^\/\S+\s*/, '').trim();
+    }
+
     async function checkAndRepairTables(d1) {
       const expectedTables = {
         user_states: {
@@ -217,6 +224,7 @@ export default {
             verification_code: 'TEXT',
             code_expiry: 'INTEGER',
             last_verification_message_id: 'TEXT',
+            verification_type: 'TEXT',
             is_first_verification: 'BOOLEAN DEFAULT TRUE',
             is_rate_limited: 'BOOLEAN DEFAULT FALSE',
             is_verifying: 'BOOLEAN DEFAULT FALSE'
@@ -290,11 +298,20 @@ export default {
         d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
           .bind('verification_enabled', 'true').run(),
         d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-          .bind('user_raw_enabled', 'true').run()
+          .bind('user_raw_enabled', 'true').run(),
+        d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
+          .bind('verification_mode', 'math').run(),
+        d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
+          .bind('custom_verification_question', '').run(),
+        d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
+          .bind('custom_verification_answer', '').run()
       ]);
 
       settingsCache.set('verification_enabled', (await getSetting('verification_enabled', d1)) === 'true');
       settingsCache.set('user_raw_enabled', (await getSetting('user_raw_enabled', d1)) === 'true');
+      settingsCache.set('verification_mode', await getSetting('verification_mode', d1));
+      settingsCache.set('custom_verification_question', await getSetting('custom_verification_question', d1));
+      settingsCache.set('custom_verification_answer', await getSetting('custom_verification_answer', d1));
     }
 
     async function createTable(d1, tableName, structure) {
@@ -320,7 +337,7 @@ export default {
         await d1.batch(
           expiredCodes.results.map(({ chat_id }) =>
             d1.prepare(
-              'UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?'
+              'UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, verification_type = NULL, is_verifying = FALSE WHERE chat_id = ?'
             ).bind(chat_id)
           )
         );
@@ -359,6 +376,10 @@ export default {
         const topicId = message.message_thread_id;
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
+          if (botCommand && ['/set_verify_mode', '/set_verify_question', '/set_verify_answer', '/show_verify_config'].includes(botCommand)) {
+            await handleVerificationConfigCommand(message.from?.id?.toString() || null, topicId, text, botCommand);
+            return;
+          }
           if (privateChatId && botCommand === '/admin') {
             await sendAdminPanel(chatId, topicId, privateChatId, messageId);
             return;
@@ -395,9 +416,14 @@ export default {
         const isFirstVerification = userState.is_first_verification;
         const isRateLimited = await checkMessageRate(chatId);
         const isVerifying = userState.is_verifying || false;
+        const activeVerificationType = userState.verification_type || await getVerificationMode();
 
         if (!isVerified || (isRateLimited && !isFirstVerification)) {
           if (isVerifying) {
+            if (activeVerificationType === 'custom_qa') {
+              await handleCustomVerificationResponse(chatId, text, userState);
+              return;
+            }
             // 检查验证码是否已过期
             const storedCode = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
               .bind(chatId)
@@ -409,10 +435,10 @@ export default {
             if (isCodeExpired) {
               // 如果验证码已过期，重新发送验证码
               await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
-              await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
+              await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, verification_type = NULL, is_verifying = FALSE WHERE chat_id = ?')
                 .bind(chatId)
                 .run();
-              userStateCache.set(chatId, { ...userState, verification_code: null, code_expiry: null, is_verifying: false });
+              userStateCache.set(chatId, createDefaultUserState({ ...userState, verification_code: null, code_expiry: null, last_verification_message_id: null, verification_type: null, is_verifying: false }));
               
               // 删除旧的验证消息（如果存在）
               try {
@@ -590,6 +616,65 @@ export default {
       await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态和消息频率已重置，当前子话题将继续复用。`);
     }
 
+    async function handleVerificationConfigCommand(senderId, topicId, text, command) {
+      if (!senderId) {
+        await sendMessageToTopic(topicId, '无法识别命令发送者，请关闭匿名管理员后重试。');
+        return;
+      }
+
+      const isAdmin = await checkIfAdmin(senderId);
+      if (!isAdmin) {
+        await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
+        return;
+      }
+
+      const payload = extractCommandPayload(text);
+
+      if (command === '/show_verify_config') {
+        const mode = await getVerificationMode();
+        const config = await getCustomVerificationConfig();
+        const modeLabel = getVerificationModeLabel(mode);
+        const questionLine = config.question ? config.question : '未设置';
+        const answerLine = config.answer ? `已设置（长度 ${config.answer.length}）` : '未设置';
+        await sendMessageToTopic(
+          topicId,
+          `当前验证配置：\n模式：${modeLabel}\n题目：${questionLine}\n答案：${answerLine}\n状态：${config.isConfigured ? '自定义问答配置完整' : '自定义问答配置未完成'}`
+        );
+        return;
+      }
+
+      if (!payload) {
+        const usageMap = {
+          '/set_verify_mode': '用法：/set_verify_mode <math|custom_qa>',
+          '/set_verify_question': '用法：/set_verify_question <题目内容>',
+          '/set_verify_answer': '用法：/set_verify_answer <答案内容>'
+        };
+        await sendMessageToTopic(topicId, usageMap[command] || '命令参数不能为空。');
+        return;
+      }
+
+      if (command === '/set_verify_mode') {
+        const nextMode = payload.toLowerCase();
+        if (!['math', 'custom_qa'].includes(nextMode)) {
+          await sendMessageToTopic(topicId, '验证模式仅支持 math 或 custom_qa。');
+          return;
+        }
+        await switchVerificationMode(topicId, nextMode);
+        return;
+      }
+
+      if (command === '/set_verify_question') {
+        await setSetting('custom_verification_question', payload);
+        await sendMessageToTopic(topicId, `自定义问答题目已更新：\n${payload}`);
+        return;
+      }
+
+      if (command === '/set_verify_answer') {
+        await setSetting('custom_verification_answer', payload);
+        await sendMessageToTopic(topicId, `自定义问答答案已更新，当前答案长度：${payload.length}`);
+      }
+    }
+
     function createDefaultUserState(overrides = {}) {
       return {
         is_blocked: false,
@@ -599,6 +684,7 @@ export default {
         verification_code: null,
         code_expiry: null,
         last_verification_message_id: null,
+        verification_type: null,
         is_verifying: false,
         ...overrides
       };
@@ -610,6 +696,7 @@ export default {
         && typeof state.is_first_verification !== 'undefined'
         && typeof state.is_verified !== 'undefined'
         && Object.prototype.hasOwnProperty.call(state, 'verified_expiry')
+        && Object.prototype.hasOwnProperty.call(state, 'verification_type')
         && typeof state.is_verifying !== 'undefined';
     }
 
@@ -627,14 +714,14 @@ export default {
         return createDefaultUserState(userState);
       }
 
-      const storedState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_verifying FROM user_states WHERE chat_id = ?')
+      const storedState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, verification_type, is_verifying FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
 
       if (!storedState) {
         userState = createDefaultUserState();
-        await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_verifying) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .bind(chatId, false, true, false, null, null, null, null, false)
+        await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, verification_type, is_verifying) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .bind(chatId, false, true, false, null, null, null, null, null, false)
           .run();
       } else {
         userState = createDefaultUserState(storedState);
@@ -642,6 +729,54 @@ export default {
 
       userStateCache.set(chatId, userState);
       return userState;
+    }
+
+    function normalizeVerificationText(value) {
+      return String(value || '')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .toLowerCase();
+    }
+
+    function getVerificationModeLabel(mode) {
+      return mode === 'custom_qa' ? '自定义问答验证' : '数学题验证';
+    }
+
+    function getVerificationModeToggleLabel(mode) {
+      return mode === 'custom_qa' ? '切换到数学题' : '切换到自定义问答';
+    }
+
+    async function getVerificationMode() {
+      const mode = await getSetting('verification_mode', env.D1);
+      return mode === 'custom_qa' ? 'custom_qa' : 'math';
+    }
+
+    async function getCustomVerificationConfig() {
+      const [question, answer] = await Promise.all([
+        getSetting('custom_verification_question', env.D1),
+        getSetting('custom_verification_answer', env.D1)
+      ]);
+
+      return {
+        question: question || '',
+        answer: answer || '',
+        normalizedAnswer: normalizeVerificationText(answer || ''),
+        isConfigured: !!(question && question.trim() && answer && answer.trim())
+      };
+    }
+
+    async function switchVerificationMode(topicId, nextMode) {
+      if (nextMode === 'custom_qa') {
+        const config = await getCustomVerificationConfig();
+        if (!config.isConfigured) {
+          await sendMessageToTopic(topicId, '请先使用命令设置题目和答案后再切换模式：\n/set_verify_question <题目内容>\n/set_verify_answer <答案内容>');
+          return false;
+        }
+      }
+
+      await setSetting('verification_mode', nextMode);
+      await sendMessageToTopic(topicId, `验证模式已切换为${getVerificationModeLabel(nextMode)}。`);
+      return true;
     }
 
     async function resetUserState(targetChatId) {
@@ -652,8 +787,8 @@ export default {
 
       const resetState = createDefaultUserState({ is_blocked: isBlocked });
       await env.D1.batch([
-        env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_verifying) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .bind(targetChatId, resetState.is_blocked, resetState.is_first_verification, resetState.is_verified, resetState.verified_expiry, resetState.verification_code, resetState.code_expiry, resetState.last_verification_message_id, resetState.is_verifying),
+        env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, verification_type, is_verifying) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .bind(targetChatId, resetState.is_blocked, resetState.is_first_verification, resetState.is_verified, resetState.verified_expiry, resetState.verification_code, resetState.code_expiry, resetState.last_verification_message_id, resetState.verification_type, resetState.is_verifying),
         env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId)
       ]);
       userStateCache.set(targetChatId, resetState);
@@ -670,10 +805,21 @@ export default {
     }
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
-      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-      const isBlocked = await getUserBlockedState(privateChatId);
-      const previousPanelMessageId = await getAdminPanelMessageId(topicId);
+      const [
+        verificationSetting,
+        userRawSetting,
+        isBlocked,
+        previousPanelMessageId,
+        verificationMode
+      ] = await Promise.all([
+        getSetting('verification_enabled', env.D1),
+        getSetting('user_raw_enabled', env.D1),
+        getUserBlockedState(privateChatId),
+        getAdminPanelMessageId(topicId),
+        getVerificationMode()
+      ]);
+      const verificationEnabled = verificationSetting === 'true';
+      const userRawEnabled = userRawSetting === 'true';
 
       const buttons = [
         [
@@ -684,6 +830,9 @@ export default {
         [
           { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
+        ],
+        [
+          { text: getVerificationModeToggleLabel(verificationMode), callback_data: `toggle_verification_mode_${privateChatId}` }
         ],
         [
           { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
@@ -697,7 +846,7 @@ export default {
         ]
       ];
 
-      const adminMessage = '管理员面板：请选择操作';
+      const adminMessage = `管理员面板：请选择操作\n当前验证模式：${getVerificationModeLabel(verificationMode)}`;
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -848,14 +997,81 @@ export default {
         if (value === 'false') {
           const nowSeconds = Math.floor(Date.now() / 1000);
           const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_verifying = ?, verification_code = NULL, code_expiry = NULL, is_first_verification = ? WHERE chat_id NOT IN (SELECT chat_id FROM user_states WHERE is_blocked = TRUE)')
+          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_verifying = ?, verification_code = NULL, code_expiry = NULL, verification_type = NULL, is_first_verification = ? WHERE chat_id NOT IN (SELECT chat_id FROM user_states WHERE is_blocked = TRUE)')
             .bind(true, verifiedExpiry, false, false)
             .run();
           userStateCache.clear();
         }
       } else if (key === 'user_raw_enabled') {
         settingsCache.set('user_raw_enabled', value === 'true');
+      } else if (settingsCache.has(key)) {
+        settingsCache.set(key, value);
       }
+    }
+
+    async function completeUserVerification(chatId) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const verifiedExpiry = nowSeconds + 3600 * 24;
+      await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, verification_type = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
+        .bind(true, verifiedExpiry, false, false, chatId)
+        .run();
+
+      const verificationState = createDefaultUserState(await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, verification_type, is_verifying FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first());
+      userStateCache.set(chatId, verificationState);
+
+      let rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
+        .bind(chatId)
+        .first() || { message_count: 0, window_start: nowSeconds * 1000 };
+      rateData.message_count = 0;
+      rateData.window_start = nowSeconds * 1000;
+      messageRateCache.set(chatId, rateData);
+      await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
+        .bind(0, nowSeconds * 1000, chatId)
+        .run();
+
+      const successMessage = await getVerificationSuccessMessage();
+      await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
+      const userInfo = await getUserInfo(chatId);
+      await ensureUserTopic(chatId, userInfo);
+    }
+
+    async function handleCustomVerificationResponse(chatId, text, userState) {
+      if (!text.trim()) {
+        await sendMessageToUser(chatId, '请直接发送文字答案完成验证。');
+        return;
+      }
+
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const storedAnswer = userState.verification_code;
+      const codeExpiry = userState.code_expiry;
+      const lastVerificationMessageId = userState.last_verification_message_id;
+
+      if (!storedAnswer || (codeExpiry && nowSeconds > codeExpiry)) {
+        await sendMessageToUser(chatId, '验证题已过期，正在为您发送新的验证题...');
+        await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, verification_type = NULL, is_verifying = FALSE WHERE chat_id = ?')
+          .bind(chatId)
+          .run();
+        userStateCache.set(chatId, createDefaultUserState({ ...userState, verification_code: null, code_expiry: null, last_verification_message_id: null, verification_type: null, is_verifying: false }));
+
+        if (lastVerificationMessageId) {
+          await deleteMessageSafely(chatId, lastVerificationMessageId, '删除旧验证题失败');
+        }
+
+        await handleVerification(chatId, 0);
+        return;
+      }
+
+      if (normalizeVerificationText(text) === storedAnswer) {
+        await completeUserVerification(chatId);
+        if (lastVerificationMessageId) {
+          await deleteMessageSafely(chatId, lastVerificationMessageId, '删除验证题失败');
+        }
+        return;
+      }
+
+      await sendMessageToUser(chatId, '答案错误，请重新输入。');
     }
 
     async function onCallbackQuery(callbackQuery) {
@@ -882,6 +1098,9 @@ export default {
         privateChatId = parts.slice(3).join('_');
       } else if (data.startsWith('delete_user_topic_')) {
         action = 'delete_user_topic';
+        privateChatId = parts.slice(3).join('_');
+      } else if (data.startsWith('toggle_verification_mode_')) {
+        action = 'toggle_verification_mode';
         privateChatId = parts.slice(3).join('_');
       } else if (data.startsWith('toggle_verification_')) {
         action = 'toggle_verification';
@@ -913,6 +1132,10 @@ export default {
         }
 
         let verificationState = await getOrCreateUserState(chatId);
+        if (verificationState.verification_type === 'custom_qa') {
+          await sendMessageToUser(chatId, '当前验证方式为自定义问答，请直接发送文字答案。');
+          return;
+        }
 
         const storedCode = verificationState.verification_code;
         const codeExpiry = verificationState.code_expiry;
@@ -921,10 +1144,10 @@ export default {
 
         if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
           await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
-          await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
+          await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, verification_type = NULL, is_verifying = FALSE WHERE chat_id = ?')
             .bind(chatId)
             .run();
-          userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
+          userStateCache.set(chatId, createDefaultUserState({ ...verificationState, verification_code: null, code_expiry: null, last_verification_message_id: null, verification_type: null, is_verifying: false }));
           
           await deleteMessageSafely(chatId, messageId, '删除过期验证按钮失败');
           
@@ -947,29 +1170,7 @@ export default {
         }
 
         if (result === 'correct') {
-          const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
-            .bind(true, verifiedExpiry, false, false, chatId)
-            .run();
-          verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_first_verification, is_verifying FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          userStateCache.set(chatId, verificationState);
-
-          let rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
-            .bind(chatId)
-            .first() || { message_count: 0, window_start: nowSeconds * 1000 };
-          rateData.message_count = 0;
-          rateData.window_start = nowSeconds * 1000;
-          messageRateCache.set(chatId, rateData);
-          await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
-            .bind(0, nowSeconds * 1000, chatId)
-            .run();
-
-          const successMessage = await getVerificationSuccessMessage();
-          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
-          const userInfo = await getUserInfo(chatId);
-          await ensureUserTopic(chatId, userInfo);
+          await completeUserVerification(chatId);
         } else {
           await sendMessageToUser(chatId, '验证失败，请重新尝试。');
           shouldDeleteVerificationMessage = false;
@@ -995,14 +1196,11 @@ export default {
           if (isBlocked) {
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 当前已被拉黑。`);
           } else {
-            let state = userStateCache.get(privateChatId);
-            if (state === undefined) {
-              state = { is_blocked: false };
-            }
+            let state = await getOrCreateUserState(privateChatId);
             state.is_blocked = true;
             userStateCache.set(privateChatId, state);
-            await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
-              .bind(privateChatId, true)
+            await env.D1.prepare('UPDATE user_states SET is_blocked = ? WHERE chat_id = ?')
+              .bind(true, privateChatId)
               .run();
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
           }
@@ -1011,15 +1209,12 @@ export default {
           if (!isBlocked) {
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 当前未被拉黑。`);
           } else {
-            let state = userStateCache.get(privateChatId);
-            if (state === undefined) {
-              state = { is_blocked: true, is_first_verification: true };
-            }
+            let state = await getOrCreateUserState(privateChatId);
             state.is_blocked = false;
             state.is_first_verification = true;
             userStateCache.set(privateChatId, state);
-            await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
-              .bind(privateChatId, false, true)
+            await env.D1.prepare('UPDATE user_states SET is_blocked = ?, is_first_verification = ? WHERE chat_id = ?')
+              .bind(false, true, privateChatId)
               .run();
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
           }
@@ -1028,6 +1223,11 @@ export default {
           const newState = !currentState;
           await setSetting('verification_enabled', newState.toString());
           await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
+        } else if (action === 'toggle_verification_mode') {
+          const currentMode = await getVerificationMode();
+          const nextMode = currentMode === 'custom_qa' ? 'math' : 'custom_qa';
+          const switched = await switchVerificationMode(topicId, nextMode);
+          callbackNotice = switched ? `已切换为${getVerificationModeLabel(nextMode)}` : '请先设置题目和答案';
         } else if (action === 'check_blocklist') {
           const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
             .bind(true)
@@ -1103,9 +1303,10 @@ export default {
 
         userState.verification_code = null;
         userState.code_expiry = null;
+        userState.verification_type = null;
         userState.is_verifying = true;
         userStateCache.set(chatId, userState);
-        await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = ? WHERE chat_id = ?')
+        await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, verification_type = NULL, is_verifying = ? WHERE chat_id = ?')
           .bind(true, chatId)
           .run();
 
@@ -1145,6 +1346,19 @@ export default {
     }
 
     async function sendVerification(chatId) {
+      const mode = await getVerificationMode();
+      if (mode === 'custom_qa') {
+        const config = await getCustomVerificationConfig();
+        if (config.isConfigured) {
+          await sendCustomVerification(chatId, config);
+          return;
+        }
+      }
+
+      await sendMathVerification(chatId);
+    }
+
+    async function sendMathVerification(chatId) {
       try {
         const num1 = Math.floor(Math.random() * 10);
         const num2 = Math.floor(Math.random() * 10);
@@ -1167,15 +1381,12 @@ export default {
         const nowSeconds = Math.floor(Date.now() / 1000);
         const codeExpiry = nowSeconds + 300;
 
-        let userState = userStateCache.get(chatId);
-        if (userState === undefined) {
-          userState = { verification_code: correctResult.toString(), code_expiry: codeExpiry, last_verification_message_id: null, is_verifying: true };
-        } else {
-          userState.verification_code = correctResult.toString();
-          userState.code_expiry = codeExpiry;
-          userState.last_verification_message_id = null;
-          userState.is_verifying = true;
-        }
+        let userState = await getOrCreateUserState(chatId);
+        userState.verification_code = correctResult.toString();
+        userState.code_expiry = codeExpiry;
+        userState.last_verification_message_id = null;
+        userState.verification_type = 'math';
+        userState.is_verifying = true;
         userStateCache.set(chatId, userState);
 
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -1191,8 +1402,8 @@ export default {
         if (data.ok) {
           userState.last_verification_message_id = data.result.message_id.toString();
           userStateCache.set(chatId, userState);
-          await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
-            .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
+          await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, verification_type = ?, is_verifying = ? WHERE chat_id = ?')
+            .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), 'math', true, chatId)
             .run();
         } else {
           throw new Error(`Telegram API 返回错误: ${data.description || '未知错误'}`);
@@ -1200,6 +1411,44 @@ export default {
       } catch (error) {
         console.error(`发送验证码失败: ${error.message}`);
         throw error; // 向上传递错误以便调用方处理
+      }
+    }
+
+    async function sendCustomVerification(chatId, config) {
+      try {
+        const question = `${config.question}\n请直接发送文字答案完成验证。`;
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const codeExpiry = nowSeconds + 300;
+
+        let userState = await getOrCreateUserState(chatId);
+        userState.verification_code = config.normalizedAnswer;
+        userState.code_expiry = codeExpiry;
+        userState.last_verification_message_id = null;
+        userState.verification_type = 'custom_qa';
+        userState.is_verifying = true;
+        userStateCache.set(chatId, userState);
+
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: question
+          })
+        });
+        const data = await response.json();
+        if (data.ok) {
+          userState.last_verification_message_id = data.result.message_id.toString();
+          userStateCache.set(chatId, userState);
+          await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, verification_type = ?, is_verifying = ? WHERE chat_id = ?')
+            .bind(config.normalizedAnswer, codeExpiry, data.result.message_id.toString(), 'custom_qa', true, chatId)
+            .run();
+        } else {
+          throw new Error(`Telegram API 返回错误: ${data.description || '未知错误'}`);
+        }
+      } catch (error) {
+        console.error(`发送自定义验证题失败: ${error.message}`);
+        throw error;
       }
     }
 
