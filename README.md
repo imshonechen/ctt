@@ -135,9 +135,9 @@
 
 说明：
 
-- 仓库已提供`wrangler.toml`，其中已包含`main`、`compatibility_date`与`keep_vars`等基础配置。
+- 仓库已提供`wrangler.toml`作为实际部署配置，同时提供`wrangler.example.toml`作为示例模板。
 - `keep_vars = true`用于保留已在 Cloudflare Worker 控制台中配置的运行时变量，避免后续自动部署时覆盖普通变量。
-- `wrangler.toml`当前为精简配置，只负责 Worker 入口、兼容日期和变量保留策略，不在仓库中写入每个部署者自己的私有配置。
+- 如果您是 fork 后自行部署，可直接参考`wrangler.example.toml`填写自己的 Worker 名称、D1 数据库名称和数据库 ID；机密变量仍建议在 Cloudflare 控制台中配置。
 
 #### 步骤 4：配置运行时变量和绑定
 
@@ -149,7 +149,7 @@
   - `MAX_MESSAGES_PER_MINUTE_ENV`
 - **设置 > 绑定**
   - D1 数据库绑定名必须为`D1`
-- 当前仓库不会在`wrangler.toml`中写死`BOT_TOKEN_ENV`、`GROUP_ID_ENV`、`MAX_MESSAGES_PER_MINUTE_ENV`和 D1 绑定信息，避免公开仓库泄露每个部署者自己的配置。
+- 当前仓库不会在配置文件中写死`BOT_TOKEN_ENV`、`GROUP_ID_ENV`、`MAX_MESSAGES_PER_MINUTE_ENV`等私密变量；如需示例可参考`wrangler.example.toml`。
 
 #### 步骤 5：触发部署并测试
 

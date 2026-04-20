@@ -5,11 +5,11 @@ compatibility_date = "2026-04-20"
 # 保留 Worker 控制台中已配置的普通变量。
 keep_vars = true
 
-# D1 数据库绑定，部署前改成你自己的数据库名称和 ID。
+# D1 数据库绑定示例，使用前改成你自己的数据库名称和 ID。
 [[d1_databases]]
 binding = "D1"
-database_name = "cfteletrans-db"
-database_id = "d0b1f279-db3e-4a1d-ae25-3aea76d3df9c"
+database_name = "your-d1-database-name"
+database_id = "your-d1-database-id"
 
 # 控制台日志开关。
 [observability]
