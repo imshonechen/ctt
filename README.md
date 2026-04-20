@@ -18,7 +18,7 @@
 
 以下是 CFTeleTrans 项目的截图： 
 
-![CFTeleTrans 截图](https://awtc.pp.ua/ctt.png)
+![CFTeleTrans 截图](picture/ctt.png)
 
 ## 特点与亮点
 
@@ -115,7 +115,7 @@
 #### 步骤 1：准备仓库
 
 - 先 fork 本项目，或将本项目同步到您自己的 GitHub 仓库。
-- 确认仓库根目录中包含`_worker.js`、`package.json`和`README.md`。
+- 确认仓库根目录中包含`_worker.js`、`wrangler.toml`和`README.md`。
 
 #### 步骤 2：创建或打开Worker项目
 
@@ -161,14 +161,6 @@
 
 - 当前 README 主要整理两种最直接的部署方式：**复制粘贴`_worker.js`** 与 **连接 GitHub 自动部署**。
 - 项目也可以运行在 Cloudflare Pages Advanced Mode，但如果您只是部署本项目本身，优先推荐以上两种方案，流程更直观、问题也更少。
-- 生成 README 中 Star 图所需的依赖已单独移到`scripts`目录，不会再影响线上部署。
-- 如果您需要手动生成 README 中的 Star 图，请在`scripts`目录单独安装依赖后执行：
-
-```bash
-npm --prefix scripts install
-npm run generate-star-chart
-```
-
 
 ## 需要在 Cloudflare 绑定的变量表
 
@@ -192,29 +184,26 @@ npm run generate-star-chart
 - `/reset_user <chat_id>`：管理员命令，用于重置指定用户的状态、消息记录和话题映射。
 
 
-## 灵感来源
-本项目的灵感来源于 Telegram-interactive-bot(部署在服务器)
+## 上游项目与灵感
+
+本项目基于上游仓库 [iawooo/ctt](https://github.com/iawooo/ctt) fork，并结合当前仓库的部署方式与维护需求做了调整和整理。
+
+相关设计思路也参考了以下项目与资料：
 
 - [Telegram-interactive-bot](https://github.com/MiHaKun/Telegram-interactive-bot)
-
-## 参考文献
-
-在开发过程中，以下资源提供了宝贵的参考和指导：
-
 - [NodeSeek 帖子](https://www.nodeseek.com/post-237769-1)
 
 ## 致谢
-- 特别感谢 [VTEXS](https://vtexs.com/) 赞助本项目，感谢 [VTEXS](https://vtexs.com/)为开源社区提供算力支持！
-- [![Powered by DartNode](https://dartnode.com/branding/DN-Open-Source-sm.png)](https://dartnode.com "Powered by DartNode - Free VPS for Open Source")
-- 特别感谢 [xAI](https://x.ai/) 提供的支持和灵感，帮助我完成了本项目的开发和优化！
-- 特别感谢 [cloud flare](https://www.cloudflare.com/) 大善人！
-- 再次感谢所有测试者、贡献者和社区支持！
+
+- 感谢上游项目 [iawooo/ctt](https://github.com/iawooo/ctt) 提供的开源基础与实现思路。
+- 感谢 [Cloudflare](https://www.cloudflare.com/) 提供 Workers 与 D1 能力支持。
+- 感谢所有测试者、使用者、反馈者与贡献者。
 
 ## 贡献
 
-欢迎提交 Issue 或 Pull Request！如果您有任何改进建议或新功能需求，请随时联系我。
+欢迎提交 Issue 或 Pull Request。
 
-![Star 增长趋势](https://raw.githubusercontent.com/iawooo/StarCharts/refs/heads/main/images/ctt_star_chart.png)
+如果您准备提交与部署、配置、文档相关的改动，建议同时更新对应的 README 说明，方便后续使用者直接部署和排查问题。
 
 ## 许可证
 
@@ -222,7 +211,6 @@ npm run generate-star-chart
 
 ## 声明
 
-- **尊重原创，转载须知**  
-  如需转载，请务必注明出处，感谢支持！严禁将本项目用于任何违法犯罪行为。  
-- **二次修改与发布**  
-  欢迎基于本项目进行二次开发，但请在发布时注明原始出处，共同维护开源社区的良好氛围。
+- 本项目为基于上游仓库的 fork 版本，保留对原项目的致谢与引用。
+- 如需转载、再发布或二次开发，请遵守 MIT 许可证，并尽量注明上游项目与当前 fork 仓库来源。
+- 请勿将本项目用于任何违法违规用途。
