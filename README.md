@@ -137,6 +137,32 @@
 #### 步骤 2：填写变量后重试部署
 ![变量截图](picture/30d4b767f1c9a050999b8642f164c90c.png)
 
+#### 步骤 3：GitHub 连接部署时的构建配置
+
+如果您使用 **连接 GitHub 自动部署**，建议按以下方式配置：
+
+- Framework preset：`None`
+- Build command：`exit 0`
+- Build output directory：`.`
+- Root directory：仓库根目录
+
+说明：
+
+- 本项目使用 Pages Advanced Mode，通过根目录下的`_worker.js`运行。
+- Cloudflare 官方文档要求`_worker.js`位于 Pages 的输出目录中，因此输出目录应包含该文件。
+- 若项目无需前端构建，Cloudflare 官方建议将 Build command 设为`exit 0`，以便正常启用 Pages Functions / Advanced Mode。
+- 目前仓库根目录已移除部署无关的本地原生依赖，避免 GitHub 自动部署时因为`canvas`等依赖编译失败。
+
+#### 步骤 4：Star 图脚本说明
+
+- 根目录的部署不再依赖生成 Star 图所需的本地原生依赖。
+- 如果您需要手动生成 README 中的 Star 图，请在`scripts`目录单独安装依赖后执行：
+
+```bash
+npm --prefix scripts install
+npm run generate-star-chart
+```
+
 
 ## 灵感来源
 本项目的灵感来源于 Telegram-interactive-bot(部署在服务器)

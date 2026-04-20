@@ -1,7 +1,12 @@
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 const ChartDataLabels = require('chartjs-plugin-datalabels');
 const fs = require('fs');
+const path = require('path');
 const fetch = require('node-fetch');
+
+const repoRoot = path.resolve(__dirname, '..');
+const imagesDir = path.join(repoRoot, 'images');
+const outputImagePath = path.join(imagesDir, 'star-chart.png');
 
 // 获取星标数据，支持分页
 async function fetchStargazers() {
@@ -153,9 +158,9 @@ async function generateChart() {
   console.log(`总星标数: ${starCounts[starCounts.length - 1]}`);
 
   // 创建 images 目录
-  if (!fs.existsSync('images')) {
+  if (!fs.existsSync(imagesDir)) {
     console.log('📁 创建 images 目录...');
-    fs.mkdirSync('images');
+    fs.mkdirSync(imagesDir, { recursive: true });
   }
 
   // 配置图表
@@ -219,8 +224,8 @@ async function generateChart() {
   };
 
   const image = await chartJSNodeCanvas.renderToBuffer(configuration);
-  fs.writeFileSync('images/star-chart.png', image);
-  console.log('✅ Star chart 生成成功: images/star-chart.png');
+  fs.writeFileSync(outputImagePath, image);
+  console.log(`✅ Star chart 生成成功: ${outputImagePath}`);
 }
 
 // 运行脚本
