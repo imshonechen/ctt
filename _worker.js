@@ -1062,19 +1062,22 @@ export default {
         userRawSetting,
         isBlocked,
         previousPanelMessageId,
-        verificationMode
+        verificationMode,
+        targetUserInfo
       ] = await Promise.all([
         getSetting('verification_enabled', env.D1),
         getSetting('user_raw_enabled', env.D1),
         getUserBlockedState(privateChatId),
         getAdminPanelMessageId(topicId),
-        getVerificationMode()
+        getVerificationMode(),
+        getUserInfo(privateChatId)
       ]);
       const verificationEnabled = verificationSetting === 'true';
       const userRawEnabled = userRawSetting === 'true';
       const verificationStatusLabel = verificationEnabled ? '验证开' : '验证关';
       const rawStatusLabel = userRawEnabled ? 'Raw开' : 'Raw关';
       const modeStatusLabel = verificationMode === 'custom_qa' ? '问答' : '数学';
+      const targetLabel = buildModerationTargetLabel(targetUserInfo, privateChatId);
 
       const buttons = [
         [
@@ -1096,7 +1099,7 @@ export default {
         ]
       ];
 
-      const adminMessage = `管理面板\n用户 ${privateChatId} | ${verificationStatusLabel} | ${modeStatusLabel} | ${rawStatusLabel}`;
+      const adminMessage = `管理面板\n${targetLabel} | ${verificationStatusLabel} | ${modeStatusLabel} | ${rawStatusLabel}`;
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1104,6 +1107,8 @@ export default {
           chat_id: chatId,
           message_thread_id: topicId,
           text: adminMessage,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
           reply_markup: { inline_keyboard: buttons }
         })
       });
@@ -1443,14 +1448,24 @@ export default {
 
         if (action === 'block') {
           const result = await setUserBlockedState(privateChatId, true);
-          await sendMessageToTopic(topicId, result.changed
-            ? `用户 ${privateChatId} 已被拉黑，消息将不再转发。`
-            : `用户 ${privateChatId} 当前已被拉黑。`);
+          const targetLabel = buildModerationTargetLabel(await getUserInfo(privateChatId), privateChatId);
+          await sendMessageToTopic(
+            topicId,
+            result.changed
+              ? `${targetLabel} 已被拉黑，消息将不再转发。`
+              : `${targetLabel} 当前已被拉黑。`,
+            { parse_mode: 'HTML', disable_web_page_preview: true }
+          );
         } else if (action === 'unblock') {
           const result = await setUserBlockedState(privateChatId, false);
-          await sendMessageToTopic(topicId, result.changed
-            ? `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`
-            : `用户 ${privateChatId} 当前未被拉黑。`);
+          const targetLabel = buildModerationTargetLabel(await getUserInfo(privateChatId), privateChatId);
+          await sendMessageToTopic(
+            topicId,
+            result.changed
+              ? `${targetLabel} 已解除拉黑，消息将继续转发。`
+              : `${targetLabel} 当前未被拉黑。`,
+            { parse_mode: 'HTML', disable_web_page_preview: true }
+          );
         } else if (action === 'toggle_verification') {
           const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
           const newState = !currentState;
@@ -1765,11 +1780,22 @@ export default {
       const safeNotificationContent = notificationContent.length > 3000
         ? `${notificationContent.slice(0, 3000)}\n...`
         : notificationContent;
-      const userNameLine = userName ? `用户名: @${userName}` : '用户名: 未设置';
-      const pinnedMessage = `昵称: ${nickname}\n${userNameLine}\nUserID: ${userId}\n发起时间: ${formattedTime}${safeNotificationContent ? `\n\n${safeNotificationContent}` : ''}`;
+      const topicUserInfo = {
+        id: String(userId),
+        username: userName || `User_${userId}`,
+        nickname: nickname || userName || `User_${userId}`
+      };
+      const nicknameLine = `昵称: ${buildTopicSenderLabel(topicUserInfo, userId)}`;
+      const userNameLine = hasPublicUsername(topicUserInfo)
+        ? `用户名: <a href="https://t.me/${topicUserInfo.username}">@${escapeHtml(topicUserInfo.username)}</a>`
+        : '用户名: 未设置';
+      const pinnedMessage = `${nicknameLine}\n${userNameLine}\nUserID: ${escapeHtml(userId)}\n发起时间: ${escapeHtml(formattedTime)}${safeNotificationContent ? `\n\n${escapeHtml(safeNotificationContent)}` : ''}`;
 
       try {
-        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
+        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true
+        });
         const messageId = messageResponse.result.message_id;
         await pinMessage(topicId, messageId);
       } catch (error) {
