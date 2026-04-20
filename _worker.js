@@ -676,7 +676,7 @@ export default {
     }
 
     async function getNotificationContent() {
-      const response = await fetch('https://github.com/imshonechen/ctt/blob/main/CFTeleTrans/notification.md');
+      const response = await fetch('https://raw.githubusercontent.com/imshonechen/ctt/main/CFTeleTrans/notification.md');
       if (!response.ok) return '';
       const content = await response.text();
       return content.trim() || '';
@@ -1195,10 +1195,19 @@ export default {
       const now = new Date();
       const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
       const notificationContent = await getNotificationContent();
-      const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
-      const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
-      const messageId = messageResponse.result.message_id;
-      await pinMessage(topicId, messageId);
+      const safeNotificationContent = notificationContent.length > 3000
+        ? `${notificationContent.slice(0, 3000)}\n...`
+        : notificationContent;
+      const userNameLine = userName ? `用户名: @${userName}` : '用户名: 未设置';
+      const pinnedMessage = `昵称: ${nickname}\n${userNameLine}\nUserID: ${userId}\n发起时间: ${formattedTime}${safeNotificationContent ? `\n\n${safeNotificationContent}` : ''}`;
+
+      try {
+        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
+        const messageId = messageResponse.result.message_id;
+        await pinMessage(topicId, messageId);
+      } catch (error) {
+        console.error(`初始化子话题 ${topicId} 的欢迎消息失败: ${error.message}`);
+      }
 
       return topicId;
     }
