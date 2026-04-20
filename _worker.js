@@ -613,6 +613,14 @@ export default {
         && typeof state.is_verifying !== 'undefined';
     }
 
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
     async function getOrCreateUserState(chatId) {
       let userState = userStateCache.get(chatId);
       if (hasCompleteUserState(userState)) {
@@ -1024,10 +1032,23 @@ export default {
           const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
             .bind(true)
             .all();
-          const blockList = blockedUsers.results.length > 0 
-            ? blockedUsers.results.map(row => row.chat_id).join('\n')
+          const blockList = blockedUsers.results.length > 0
+            ? (await Promise.all(
+                blockedUsers.results.map(async (row) => {
+                  const userInfo = await getUserInfo(row.chat_id);
+                  const hasUsername = userInfo?.username && !userInfo.username.startsWith('User_');
+                  const nickname = escapeHtml(userInfo?.nickname || `User_${row.chat_id}`);
+                  const nicknameLabel = hasUsername
+                    ? `<a href="https://t.me/${userInfo.username}">${nickname}</a>`
+                    : nickname;
+                  return `${row.chat_id} | ${nicknameLabel}`;
+                })
+              )).join('\n')
             : '当前没有被拉黑的用户。';
-          await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`);
+          await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+          });
         } else if (action === 'toggle_user_raw') {
           const currentState = (await getSetting('user_raw_enabled', env.D1)) === 'true';
           const newState = !currentState;
@@ -1313,7 +1334,7 @@ export default {
       adminPanelCache.set(topicId, messageId);
     }
 
-    async function sendMessageToTopic(topicId, text) {
+    async function sendMessageToTopic(topicId, text, options = {}) {
       if (!text.trim()) {
         throw new Error('Message text is empty');
       }
@@ -1321,7 +1342,8 @@ export default {
       const requestBody = {
         chat_id: GROUP_ID,
         text: text,
-        message_thread_id: topicId
+        message_thread_id: topicId,
+        ...options
       };
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
