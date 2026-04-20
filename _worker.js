@@ -1,6 +1,8 @@
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
+let BOT_ID = null;
+let BOT_USERNAME = null;
 
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
@@ -47,7 +49,12 @@ const messageRateCache = new LRUCache(1000);
 
 export default {
   async fetch(request, env) {
-    BOT_TOKEN = env.BOT_TOKEN_ENV || null;
+    const nextBotToken = env.BOT_TOKEN_ENV || null;
+    if (BOT_TOKEN !== nextBotToken) {
+      BOT_ID = null;
+      BOT_USERNAME = null;
+    }
+    BOT_TOKEN = nextBotToken;
     GROUP_ID = env.GROUP_ID_ENV || null;
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
@@ -129,6 +136,25 @@ export default {
     }
 
     async function getBotId() {
+      if (BOT_ID) {
+        return BOT_ID;
+      }
+      const botInfo = await getBotInfo();
+      return botInfo.id;
+    }
+
+    async function getBotUsername() {
+      if (BOT_USERNAME !== null) {
+        return BOT_USERNAME;
+      }
+      const botInfo = await getBotInfo();
+      return botInfo.username;
+    }
+
+    async function getBotInfo() {
+      if (BOT_ID && BOT_USERNAME !== null) {
+        return { id: BOT_ID, username: BOT_USERNAME };
+      }
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -136,7 +162,47 @@ export default {
       });
       const data = await response.json();
       if (!data.ok) throw new Error(`Failed to get bot ID: ${data.description}`);
-      return data.result.id;
+      BOT_ID = data.result.id || null;
+      BOT_USERNAME = data.result.username ? data.result.username.toLowerCase() : '';
+      return { id: BOT_ID, username: BOT_USERNAME };
+    }
+
+    async function extractBotCommand(message) {
+      const rawText = message.text || '';
+      if (!rawText.trim().startsWith('/')) {
+        return null;
+      }
+
+      const entity = Array.isArray(message.entities)
+        ? message.entities.find(item => item.type === 'bot_command' && item.offset === 0 && typeof item.length === 'number')
+        : null;
+
+      const rawCommand = entity
+        ? rawText.slice(entity.offset, entity.offset + entity.length)
+        : rawText.trim().split(/\s+/, 1)[0];
+
+      if (!entity && !/^\/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?$/.test(rawCommand)) {
+        return null;
+      }
+
+      return await normalizeBotCommand(rawCommand);
+    }
+
+    async function normalizeBotCommand(rawCommand) {
+      const match = rawCommand.match(/^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?$/);
+      if (!match) {
+        return null;
+      }
+
+      const [, commandName, targetUsername] = match;
+      if (targetUsername) {
+        const botUsername = await getBotUsername();
+        if (!botUsername || targetUsername.toLowerCase() !== botUsername) {
+          return null;
+        }
+      }
+
+      return `/${commandName.toLowerCase()}`;
     }
 
     async function checkAndRepairTables(d1) {
@@ -280,17 +346,22 @@ export default {
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
+      const botCommand = await extractBotCommand(message);
 
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
-          if (privateChatId && text === '/admin') {
+          if (privateChatId && botCommand === '/admin') {
             await sendAdminPanel(chatId, topicId, privateChatId, messageId);
             return;
           }
-          if (privateChatId && text.startsWith('/reset_user')) {
-            await handleResetUser(chatId, topicId, text);
+          if (privateChatId && botCommand === '/reset_user') {
+            await handleResetUser(message.from?.id?.toString() || null, topicId, text);
+            return;
+          }
+          if (privateChatId && botCommand) {
+            await sendMessageToTopic(topicId, `未识别的命令：${botCommand}`);
             return;
           }
           if (privateChatId) {
@@ -514,15 +585,18 @@ export default {
       }
     }
 
-    async function handleResetUser(chatId, topicId, text) {
-      const senderId = chatId;
+    async function handleResetUser(senderId, topicId, text) {
+      if (!senderId) {
+        await sendMessageToTopic(topicId, '无法识别命令发送者，请关闭匿名管理员后重试。');
+        return;
+      }
       const isAdmin = await checkIfAdmin(senderId);
       if (!isAdmin) {
         await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
         return;
       }
 
-      const parts = text.split(' ');
+      const parts = text.trim().split(/\s+/);
       if (parts.length !== 2) {
         await sendMessageToTopic(topicId, '用法：/reset_user <chat_id>');
         return;
@@ -589,14 +663,14 @@ export default {
       const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
       if (!userRawEnabled) return '验证成功！您现在可以与我聊天。';
 
-      const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/start.md');
+      const response = await fetch('https://github.com/imshonechen/ctt/raw/refs/heads/main/CFTeleTrans/start.md');
       if (!response.ok) return '验证成功！您现在可以与我聊天。';
       const message = await response.text();
       return message.trim() || '验证成功！您现在可以与我聊天。';
     }
 
     async function getNotificationContent() {
-      const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
+      const response = await fetch('https://github.com/imshonechen/ctt/blob/main/CFTeleTrans/notification.md');
       if (!response.ok) return '';
       const content = await response.text();
       return content.trim() || '';
