@@ -426,19 +426,7 @@ export default {
                   .first();
                 
                 if (lastVerification?.last_verification_message_id) {
-                  try {
-                    await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        chat_id: chatId,
-                        message_id: lastVerification.last_verification_message_id
-                      })
-                    });
-                  } catch (deleteError) {
-                    console.log(`删除旧验证消息失败: ${deleteError.message}`);
-                    // 删除失败仍继续处理
-                  }
+                  await deleteMessageSafely(chatId, lastVerification.last_verification_message_id, '删除旧验证消息失败');
                   
                   await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
                     .bind(chatId)
@@ -832,6 +820,7 @@ export default {
         const storedCode = verificationState.verification_code;
         const codeExpiry = verificationState.code_expiry;
         const nowSeconds = Math.floor(Date.now() / 1000);
+        let shouldDeleteVerificationMessage = true;
 
         if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
           await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
@@ -840,20 +829,7 @@ export default {
             .run();
           userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
           
-          // 删除旧的验证消息
-          try {
-            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: chatId,
-                message_id: messageId
-              })
-            });
-          } catch (error) {
-            console.log(`删除过期验证按钮失败: ${error.message}`);
-            // 即使删除失败也继续处理
-          }
+          await deleteMessageSafely(chatId, messageId, '删除过期验证按钮失败');
           
           // 立即发送新的验证码
           try {
@@ -899,17 +875,13 @@ export default {
           await ensureUserTopic(chatId, userInfo);
         } else {
           await sendMessageToUser(chatId, '验证失败，请重新尝试。');
+          shouldDeleteVerificationMessage = false;
           await handleVerification(chatId, messageId);
         }
 
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: messageId
-          })
-        });
+        if (shouldDeleteVerificationMessage) {
+          await deleteMessageSafely(chatId, messageId, '删除验证按钮失败');
+        }
       } else {
         const senderId = callbackQuery.from.id.toString();
         const isAdmin = await checkIfAdmin(senderId);
@@ -1016,19 +988,7 @@ export default {
           .first())?.last_verification_message_id;
 
         if (lastVerification) {
-          try {
-            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: chatId,
-                message_id: lastVerification
-              })
-            });
-          } catch (deleteError) {
-            console.log(`删除上一条验证消息失败: ${deleteError.message}`);
-            // 继续处理，即使删除失败
-          }
+          await deleteMessageSafely(chatId, lastVerification, '删除上一条验证消息失败');
           
           userState.last_verification_message_id = null;
           userStateCache.set(chatId, userState);
@@ -1303,6 +1263,43 @@ export default {
       if (!data.ok) {
         throw new Error(`Failed to send message to user: ${data.description}`);
       }
+    }
+
+    async function deleteMessageSafely(chatId, messageId, logContext = '删除消息失败') {
+      if (!chatId || !messageId) {
+        return false;
+      }
+
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: messageId
+          })
+        });
+        const data = await response.json();
+
+        if (data.ok) {
+          return true;
+        }
+
+        const description = data.description || '未知错误';
+        const normalizedDescription = description.toLowerCase();
+        if (
+          normalizedDescription.includes('message to delete not found') ||
+          normalizedDescription.includes('message can\'t be deleted')
+        ) {
+          return false;
+        }
+
+        console.log(`${logContext}: ${description}`);
+      } catch (error) {
+        console.log(`${logContext}: ${error.message}`);
+      }
+
+      return false;
     }
 
     async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
