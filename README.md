@@ -129,26 +129,27 @@
 如果您看到的是 Cloudflare 的 **Worker Git 自动构建** 页面，建议按以下方式填写：
 
 - `构建命令`：留空
-- `部署命令`：`npx wrangler deploy ./_worker.js --compatibility-date 2026-04-20`
-- `非生产分支部署命令`：`npx wrangler versions upload ./_worker.js --compatibility-date 2026-04-20`
+- `部署命令`：`npx wrangler deploy --keep-vars`
+- `非生产分支部署命令`：`npx wrangler versions upload --keep-vars`
 - `路径`：`/`
 
 说明：
 
-- 本项目的运行入口就是仓库根目录下的`_worker.js`。
-- `compatibility_date`是 Wrangler 发布 Worker 时必需的参数。
-- 显式指定`./_worker.js`可以避免 Cloudflare 在构建时把项目误判成需要静态目录的 Pages 项目。
+- 仓库已提供`wrangler.toml`，其中已包含`main`、`compatibility_date`与`keep_vars`等基础配置。
+- `keep_vars = true`用于保留已在 Cloudflare Worker 控制台中配置的运行时变量，避免后续自动部署时覆盖普通变量。
+- `wrangler.toml`当前为精简配置，只负责 Worker 入口、兼容日期和变量保留策略，不在仓库中写入每个部署者自己的私有配置。
 
 #### 步骤 4：配置运行时变量和绑定
 
 连接 GitHub 只负责自动拉取并发布代码，运行时仍需要在 Worker 项目中手动配置：
 
 - **设置 > 变量和机密**
-  - `BOT_TOKEN_ENV`
+  - `BOT_TOKEN_ENV`：建议添加为机密（Secret）
   - `GROUP_ID_ENV`
   - `MAX_MESSAGES_PER_MINUTE_ENV`
 - **设置 > 绑定**
   - D1 数据库绑定名必须为`D1`
+- 当前仓库不会在`wrangler.toml`中写死`BOT_TOKEN_ENV`、`GROUP_ID_ENV`、`MAX_MESSAGES_PER_MINUTE_ENV`和 D1 绑定信息，避免公开仓库泄露每个部署者自己的配置。
 
 #### 步骤 5：触发部署并测试
 
@@ -175,7 +176,7 @@ npm run generate-star-chart
 
 | **变量名**                  | **类型**   | **描述**                                                                 | **默认值/示例**            |
 |-----------------------------|------------|--------------------------------------------------------------------------|----------------------------|
-| `BOT_TOKEN_ENV`            | 环境变量   | Telegram Bot 的 Token，用于与 Telegram API 通信。                        | `your-telegram-bot-token`  |
+| `BOT_TOKEN_ENV`            | 机密（Secret） | Telegram Bot 的 Token，用于与 Telegram API 通信。                        | `your-telegram-bot-token`  |
 | `GROUP_ID_ENV`             | 环境变量   | Telegram 群组的 ID，用于消息转发和客服回复。                             | `-123456789`               |
 | `MAX_MESSAGES_PER_MINUTE_ENV` | 环境变量 | 每分钟允许的最大消息数，用于限制用户发送频率。                           | `40`                       |
 | `D1`                       | D1 绑定    | Cloudflare D1 数据库绑定，用于存储用户状态、消息频率、群组映射及管理员面板状态。 | `cfteletrans-db`           |

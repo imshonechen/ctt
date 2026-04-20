@@ -1,0 +1,10 @@
+name = "cfteletrans"
+main = "./_worker.js"
+compatibility_date = "2026-04-20"
+
+# 保留 Worker 控制台中已配置的普通变量。
+keep_vars = true
+
+# 控制台日志开关。
+[observability]
+enabled = true
