@@ -546,13 +546,16 @@ export default {
         }
       }
 
-      const userName = userInfo.username || `User_${chatId}`;
-      const nickname = userInfo.nickname || userName;
+      const senderLabel = buildTopicSenderLabel(userInfo, chatId);
 
       if (text) {
-        const formattedMessage = `${nickname}:\n${text}`;
-        await sendMessageToTopic(topicId, formattedMessage);
+        const formattedMessage = `${senderLabel}\n${escapeHtml(text)}`;
+        await sendMessageToTopic(topicId, formattedMessage, { parse_mode: 'HTML' });
       } else {
+        await sendMessageToTopic(topicId, senderLabel, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true
+        });
         await copyMessageToTopic(topicId, message);
       }
     }
@@ -633,7 +636,10 @@ export default {
 
       const targetChatId = parts[1];
       await resetUserState(targetChatId);
-      await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态和消息频率已重置，当前子话题将继续复用。`);
+      await sendMessageToTopic(topicId, await buildResetUserNotice(targetChatId), {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true
+      });
     }
 
     async function handleVerificationConfigCommand(message, topicId, text, command) {
@@ -649,7 +655,7 @@ export default {
         const config = await getCustomVerificationConfig();
         const modeLabel = getVerificationModeLabel(mode);
         const questionLine = config.question ? config.question : '未设置';
-        const answerLine = config.answer ? `已设置（长度 ${config.answer.length}）` : '未设置';
+        const answerLine = config.answer ? config.answer : '未设置';
         await sendMessageToTopic(
           topicId,
           `当前验证配置：\n模式：${modeLabel}\n题目：${questionLine}\n答案：${answerLine}\n状态：${config.isConfigured ? '自定义问答配置完整' : '自定义问答配置未完成'}`
@@ -685,7 +691,7 @@ export default {
 
       if (command === '/set_verify_answer') {
         await setSetting('custom_verification_answer', payload);
-        await sendMessageToTopic(topicId, `自定义问答答案已更新，当前答案长度：${payload.length}`);
+        await sendMessageToTopic(topicId, `自定义问答答案已更新：\n${payload}`);
       }
     }
 
@@ -720,6 +726,25 @@ export default {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
+    }
+
+    function hasPublicUsername(userInfo) {
+      return !!(userInfo?.username && !String(userInfo.username).startsWith('User_'));
+    }
+
+    function buildTopicSenderLabel(userInfo, chatId) {
+      const userName = userInfo?.username || `User_${chatId}`;
+      const nickname = escapeHtml(userInfo?.nickname || userName);
+      if (hasPublicUsername(userInfo)) {
+        return `<a href="https://t.me/${userInfo.username}">${nickname}</a>`;
+      }
+      return nickname;
+    }
+
+    async function buildResetUserNotice(chatId) {
+      const userInfo = await getUserInfo(chatId);
+      const senderLabel = buildTopicSenderLabel(userInfo, chatId);
+      return `${senderLabel}（${chatId}）的状态和消息频率已重置，当前子话题将继续复用。`;
     }
 
     async function getOrCreateUserState(chatId) {
@@ -757,7 +782,7 @@ export default {
     }
 
     function getVerificationModeToggleLabel(mode) {
-      return mode === 'custom_qa' ? '切换到数学题' : '切换到自定义问答';
+      return mode === 'custom_qa' ? '切到数学' : '切到问答';
     }
 
     async function getVerificationMode() {
@@ -834,33 +859,31 @@ export default {
       ]);
       const verificationEnabled = verificationSetting === 'true';
       const userRawEnabled = userRawSetting === 'true';
+      const verificationStatusLabel = verificationEnabled ? '验证开' : '验证关';
+      const rawStatusLabel = userRawEnabled ? 'Raw开' : 'Raw关';
+      const modeStatusLabel = verificationMode === 'custom_qa' ? '问答' : '数学';
 
       const buttons = [
         [
           isBlocked
-            ? { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
-            : { text: '拉黑用户', callback_data: `block_${privateChatId}` }
+            ? { text: '解黑', callback_data: `unblock_${privateChatId}` }
+            : { text: '拉黑', callback_data: `block_${privateChatId}` },
+          { text: '重置', callback_data: `reset_user_state_${privateChatId}` }
         ],
         [
-          { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
-          { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
+          { text: '删用户+话题', callback_data: `delete_user_topic_${privateChatId}` }
         ],
         [
+          { text: verificationEnabled ? '关验证' : '开验证', callback_data: `toggle_verification_${privateChatId}` },
           { text: getVerificationModeToggleLabel(verificationMode), callback_data: `toggle_verification_mode_${privateChatId}` }
         ],
         [
-          { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
-          { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
-        ],
-        [
-          { text: '重置用户', callback_data: `reset_user_state_${privateChatId}` }
-        ],
-        [
-          { text: '删除用户并删除话题', callback_data: `delete_user_topic_${privateChatId}` }
+          { text: userRawEnabled ? '关 Raw' : '开 Raw', callback_data: `toggle_user_raw_${privateChatId}` },
+          { text: '黑名单', callback_data: `check_blocklist_${privateChatId}` }
         ]
       ];
 
-      const adminMessage = `管理员面板：请选择操作\n当前验证模式：${getVerificationModeLabel(verificationMode)}`;
+      const adminMessage = `管理面板\n用户 ${privateChatId} | ${verificationStatusLabel} | ${modeStatusLabel} | ${rawStatusLabel}`;
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1270,7 +1293,10 @@ export default {
           await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
         } else if (action === 'reset_user_state') {
           await resetUserState(privateChatId);
-          await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息频率已重置，当前子话题将继续复用。`);
+          await sendMessageToTopic(topicId, await buildResetUserNotice(privateChatId), {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+          });
         } else if (action === 'delete_user_topic') {
           await resetUserState(privateChatId);
           try {
