@@ -46,6 +46,7 @@ const userInfoCache = new LRUCache(1000);
 const topicIdCache = new LRUCache(1000);
 const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
+const adminPanelCache = new LRUCache(1000);
 
 export default {
   async fetch(request, env) {
@@ -234,6 +235,12 @@ export default {
           columns: {
             chat_id: 'TEXT PRIMARY KEY',
             topic_id: 'TEXT NOT NULL'
+          }
+        },
+        admin_panel_messages: {
+          columns: {
+            topic_id: 'TEXT PRIMARY KEY',
+            message_id: 'TEXT NOT NULL'
           }
         },
         settings: {
@@ -605,6 +612,7 @@ export default {
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
       const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
+      const previousPanelMessageId = await getAdminPanelMessageId(topicId);
 
       const buttons = [
         [
@@ -625,26 +633,34 @@ export default {
       ];
 
       const adminMessage = '管理员面板：请选择操作';
-      await Promise.all([
-        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_thread_id: topicId,
-            text: adminMessage,
-            reply_markup: { inline_keyboard: buttons }
-          })
-        }),
-        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: messageId
-          })
+      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_thread_id: topicId,
+          text: adminMessage,
+          reply_markup: { inline_keyboard: buttons }
         })
-      ]);
+      });
+      const data = await response.json();
+      if (!data.ok) {
+        throw new Error(`Failed to send admin panel: ${data.description}`);
+      }
+
+      const newPanelMessageId = data.result?.message_id?.toString() || null;
+      if (newPanelMessageId) {
+        await saveAdminPanelMessageId(topicId, newPanelMessageId);
+      }
+
+      const messageIdsToDelete = Array.from(new Set(
+        [messageId?.toString(), previousPanelMessageId].filter(id => id && id !== newPanelMessageId)
+      ));
+      if (messageIdsToDelete.length > 0) {
+        await Promise.all(
+          messageIdsToDelete.map(id => deleteMessageSafely(chatId, id, '删除旧管理员面板失败'))
+        );
+      }
     }
 
     async function getVerificationSuccessMessage() {
@@ -1174,6 +1190,29 @@ export default {
         .bind(topicId)
         .first();
       return mapping?.chat_id || null;
+    }
+
+    async function getAdminPanelMessageId(topicId) {
+      let messageId = adminPanelCache.get(topicId);
+      if (messageId !== undefined) {
+        return messageId;
+      }
+
+      const result = await env.D1.prepare('SELECT message_id FROM admin_panel_messages WHERE topic_id = ?')
+        .bind(topicId)
+        .first();
+      messageId = result?.message_id || null;
+      if (messageId) {
+        adminPanelCache.set(topicId, messageId);
+      }
+      return messageId;
+    }
+
+    async function saveAdminPanelMessageId(topicId, messageId) {
+      await env.D1.prepare('INSERT OR REPLACE INTO admin_panel_messages (topic_id, message_id) VALUES (?, ?)')
+        .bind(topicId, messageId)
+        .run();
+      adminPanelCache.set(topicId, messageId);
     }
 
     async function sendMessageToTopic(topicId, text) {
