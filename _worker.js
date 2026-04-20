@@ -612,12 +612,14 @@ export default {
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
       const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
+      const isBlocked = await getUserBlockedState(privateChatId);
       const previousPanelMessageId = await getAdminPanelMessageId(topicId);
 
       const buttons = [
         [
-          { text: '拉黑用户', callback_data: `block_${privateChatId}` },
-          { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
+          isBlocked
+            ? { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
+            : { text: '拉黑用户', callback_data: `block_${privateChatId}` }
         ],
         [
           { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
@@ -746,6 +748,24 @@ export default {
         .bind(data.message_count, data.window_start, chatId)
         .run();
       return data.message_count > MAX_MESSAGES_PER_MINUTE;
+    }
+
+    async function getUserBlockedState(chatId) {
+      let state = userStateCache.get(chatId);
+      if (state === undefined) {
+        state = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first() || { is_blocked: false };
+        userStateCache.set(chatId, state);
+      } else if (typeof state.is_blocked === 'undefined') {
+        const result = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        state = { ...state, is_blocked: result?.is_blocked || false };
+        userStateCache.set(chatId, state);
+      }
+
+      return state.is_blocked === true || state.is_blocked === 1;
     }
 
     async function getSetting(key, d1) {
@@ -908,32 +928,38 @@ export default {
         }
 
         if (action === 'block') {
-          let state = userStateCache.get(privateChatId);
-          if (state === undefined) {
-            state = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
-              .bind(privateChatId)
-              .first() || { is_blocked: false };
+          const isBlocked = await getUserBlockedState(privateChatId);
+          if (isBlocked) {
+            await sendMessageToTopic(topicId, `用户 ${privateChatId} 当前已被拉黑。`);
+          } else {
+            let state = userStateCache.get(privateChatId);
+            if (state === undefined) {
+              state = { is_blocked: false };
+            }
+            state.is_blocked = true;
+            userStateCache.set(privateChatId, state);
+            await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
+              .bind(privateChatId, true)
+              .run();
+            await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
           }
-          state.is_blocked = true;
-          userStateCache.set(privateChatId, state);
-          await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
-            .bind(privateChatId, true)
-            .run();
-          await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
         } else if (action === 'unblock') {
-          let state = userStateCache.get(privateChatId);
-          if (state === undefined) {
-            state = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
-              .bind(privateChatId)
-              .first() || { is_blocked: false, is_first_verification: true };
+          const isBlocked = await getUserBlockedState(privateChatId);
+          if (!isBlocked) {
+            await sendMessageToTopic(topicId, `用户 ${privateChatId} 当前未被拉黑。`);
+          } else {
+            let state = userStateCache.get(privateChatId);
+            if (state === undefined) {
+              state = { is_blocked: true, is_first_verification: true };
+            }
+            state.is_blocked = false;
+            state.is_first_verification = true;
+            userStateCache.set(privateChatId, state);
+            await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
+              .bind(privateChatId, false, true)
+              .run();
+            await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
           }
-          state.is_blocked = false;
-          state.is_first_verification = true;
-          userStateCache.set(privateChatId, state);
-          await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
-            .bind(privateChatId, false, true)
-            .run();
-          await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
         } else if (action === 'toggle_verification') {
           const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
           const newState = !currentState;
