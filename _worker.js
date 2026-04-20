@@ -213,6 +213,17 @@ export default {
       return text.replace(/^\/\S+\s*/, '').trim();
     }
 
+    function extractPlainModerationCommand(text) {
+      const match = String(text || '').trim().match(/^(block|unblock|unban|ban|spam)\s+(.+)$/i);
+      if (!match) {
+        return null;
+      }
+      return {
+        command: `/${match[1].toLowerCase()}`,
+        payload: match[2].trim()
+      };
+    }
+
     function isAnonymousGroupAdminMessage(message) {
       return message?.chat?.id?.toString() === GROUP_ID
         && message?.sender_chat?.id?.toString() === GROUP_ID;
@@ -281,6 +292,15 @@ export default {
             key: 'TEXT PRIMARY KEY',
             value: 'TEXT'
           }
+        },
+        known_users: {
+          columns: {
+            chat_id: 'TEXT PRIMARY KEY',
+            username: 'TEXT',
+            normalized_username: 'TEXT',
+            nickname: 'TEXT',
+            updated_at: 'INTEGER'
+          }
         }
       };
 
@@ -316,6 +336,8 @@ export default {
 
         if (tableName === 'settings') {
           await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
+        } else if (tableName === 'known_users') {
+          await d1.exec('CREATE INDEX IF NOT EXISTS idx_known_users_normalized_username ON known_users (normalized_username)');
         }
       }
 
@@ -396,21 +418,40 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
       const botCommand = await extractBotCommand(message);
+      const plainModerationCommand = !botCommand ? extractPlainModerationCommand(text) : null;
+
+      if (chatId !== GROUP_ID && message.from?.id?.toString() === chatId) {
+        await rememberKnownUser(buildUserInfoFromTelegramUser(message.from, chatId));
+      }
 
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
+        const privateChatId = topicId ? await getPrivateChatId(topicId) : null;
+
+        if (botCommand && ['/set_verify_mode', '/set_verify_question', '/set_verify_answer', '/show_verify_config'].includes(botCommand)) {
+          await handleVerificationConfigCommand(message, topicId, text, botCommand);
+          return;
+        }
+
+        if ((botCommand && ['/block', '/unblock', '/unban', '/ban', '/spam'].includes(botCommand)) || plainModerationCommand) {
+          await handleDirectModerationCommand(
+            message,
+            topicId,
+            text,
+            plainModerationCommand?.command || botCommand,
+            plainModerationCommand?.payload || null
+          );
+          return;
+        }
+
+        if (botCommand === '/reset_user') {
+          await handleResetUser(message, topicId, text);
+          return;
+        }
+
         if (topicId) {
-          const privateChatId = await getPrivateChatId(topicId);
-          if (botCommand && ['/set_verify_mode', '/set_verify_question', '/set_verify_answer', '/show_verify_config'].includes(botCommand)) {
-            await handleVerificationConfigCommand(message, topicId, text, botCommand);
-            return;
-          }
           if (privateChatId && botCommand === '/admin') {
             await sendAdminPanel(chatId, topicId, privateChatId, messageId);
-            return;
-          }
-          if (privateChatId && botCommand === '/reset_user') {
-            await handleResetUser(message, topicId, text);
             return;
           }
           if (privateChatId && botCommand) {
@@ -642,6 +683,66 @@ export default {
       });
     }
 
+    async function handleDirectModerationCommand(message, topicId, text, command, payloadOverride = null) {
+      const hasAdminAccess = await ensureAdminMessageAccess(message, topicId);
+      if (!hasAdminAccess) {
+        return;
+      }
+
+      const payload = payloadOverride || extractCommandPayload(text);
+      const usageMap = {
+        '/block': '用法：/block <用户名|用户ID>\n也支持：block <用户名|用户ID>、/ban、ban、/spam、spam',
+        '/unblock': '用法：/unblock <用户名|用户ID>\n也支持：unblock <用户名|用户ID>、/unban、unban',
+        '/unban': '用法：/unban <用户名|用户ID>\n也支持：unban <用户名|用户ID>、/unblock、unblock',
+        '/ban': '用法：/ban <用户名|用户ID>\n也支持：ban <用户名|用户ID>、/block、block、/spam、spam',
+        '/spam': '用法：/spam <用户名|用户ID>\n也支持：spam <用户名|用户ID>、/block、block、/ban、ban'
+      };
+
+      if (!payload) {
+        await sendMessageToTopic(topicId, usageMap[command] || '命令参数不能为空。');
+        return;
+      }
+
+      const effectiveCommand = ['/block', '/ban', '/spam'].includes(command)
+        ? '/block'
+        : ['/unblock', '/unban'].includes(command)
+          ? '/unblock'
+          : command;
+      const target = await resolveModerationTarget(payload);
+      if (!target) {
+        await sendMessageToTopic(
+          topicId,
+          `未找到目标用户：${escapeHtml(payload)}\n按用户名操作仅支持机器人已见过并记录过的用户，也可以直接使用用户ID。`,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      const targetLabel = buildModerationTargetLabel(target.userInfo, target.chatId);
+      if (effectiveCommand === '/block') {
+        const result = await setUserBlockedState(target.chatId, true);
+        await sendMessageToTopic(
+          topicId,
+          result.changed
+            ? `${targetLabel} 已被拉黑，消息将不再转发。`
+            : `${targetLabel} 当前已被拉黑。`,
+          { parse_mode: 'HTML', disable_web_page_preview: true }
+        );
+        return;
+      }
+
+      if (effectiveCommand === '/unblock') {
+        const result = await setUserBlockedState(target.chatId, false);
+        await sendMessageToTopic(
+          topicId,
+          result.changed
+            ? `${targetLabel} 已解除拉黑，消息将继续转发。`
+            : `${targetLabel} 当前未被拉黑。`,
+          { parse_mode: 'HTML', disable_web_page_preview: true }
+        );
+      }
+    }
+
     async function handleVerificationConfigCommand(message, topicId, text, command) {
       const hasAdminAccess = await ensureAdminMessageAccess(message, topicId);
       if (!hasAdminAccess) {
@@ -732,6 +833,13 @@ export default {
       return !!(userInfo?.username && !String(userInfo.username).startsWith('User_'));
     }
 
+    function normalizeUsername(value) {
+      return String(value || '')
+        .trim()
+        .replace(/^@+/, '')
+        .toLowerCase();
+    }
+
     function buildTopicSenderLabel(userInfo, chatId) {
       const userName = userInfo?.username || `User_${chatId}`;
       const nickname = escapeHtml(userInfo?.nickname || userName);
@@ -745,6 +853,111 @@ export default {
       const userInfo = await getUserInfo(chatId);
       const senderLabel = buildTopicSenderLabel(userInfo, chatId);
       return `${senderLabel}（${chatId}）的状态和消息频率已重置，当前子话题将继续复用。`;
+    }
+
+    function buildModerationTargetLabel(userInfo, chatId) {
+      return `${buildTopicSenderLabel(userInfo, chatId)}（${chatId}）`;
+    }
+
+    function buildUserInfoFromTelegramUser(user, fallbackChatId) {
+      const resolvedChatId = String(user?.id || fallbackChatId);
+      const username = user?.username || `User_${resolvedChatId}`;
+      const nickname = user?.first_name
+        ? `${user.first_name}${user.last_name ? ` ${user.last_name}` : ''}`.trim()
+        : user?.username || `User_${resolvedChatId}`;
+      return {
+        id: resolvedChatId,
+        username,
+        nickname
+      };
+    }
+
+    async function rememberKnownUser(userInfo) {
+      if (!userInfo?.id) {
+        return;
+      }
+
+      const chatId = String(userInfo.id);
+      const storedUserInfo = {
+        id: chatId,
+        username: userInfo.username || `User_${chatId}`,
+        nickname: userInfo.nickname || userInfo.username || `User_${chatId}`
+      };
+      const normalizedUsername = hasPublicUsername(storedUserInfo)
+        ? normalizeUsername(storedUserInfo.username)
+        : null;
+
+      await env.D1.prepare(
+        'INSERT OR REPLACE INTO known_users (chat_id, username, normalized_username, nickname, updated_at) VALUES (?, ?, ?, ?, ?)'
+      )
+        .bind(chatId, storedUserInfo.username, normalizedUsername, storedUserInfo.nickname, Date.now())
+        .run();
+
+      userInfoCache.set(chatId, storedUserInfo);
+    }
+
+    async function resolveModerationTarget(identifier) {
+      const rawValue = String(identifier || '').trim();
+      if (!rawValue) {
+        return null;
+      }
+
+      if (/^\d+$/.test(rawValue)) {
+        return {
+          chatId: rawValue,
+          userInfo: await getUserInfo(rawValue)
+        };
+      }
+
+      const normalizedUsername = normalizeUsername(rawValue);
+      if (!normalizedUsername) {
+        return null;
+      }
+
+      const result = await env.D1.prepare(
+        'SELECT chat_id, username, nickname FROM known_users WHERE normalized_username = ? ORDER BY updated_at DESC LIMIT 1'
+      )
+        .bind(normalizedUsername)
+        .first();
+
+      if (!result?.chat_id) {
+        return null;
+      }
+
+      return {
+        chatId: String(result.chat_id),
+        userInfo: {
+          id: String(result.chat_id),
+          username: result.username || `User_${result.chat_id}`,
+          nickname: result.nickname || result.username || `User_${result.chat_id}`
+        }
+      };
+    }
+
+    async function setUserBlockedState(targetChatId, blocked) {
+      const state = await getOrCreateUserState(targetChatId);
+      const currentBlocked = state.is_blocked === true || state.is_blocked === 1;
+      if (currentBlocked === blocked) {
+        return { changed: false, isBlocked: currentBlocked };
+      }
+
+      state.is_blocked = blocked;
+      if (!blocked) {
+        state.is_first_verification = true;
+      }
+      userStateCache.set(targetChatId, state);
+
+      if (blocked) {
+        await env.D1.prepare('UPDATE user_states SET is_blocked = ? WHERE chat_id = ?')
+          .bind(true, targetChatId)
+          .run();
+      } else {
+        await env.D1.prepare('UPDATE user_states SET is_blocked = ?, is_first_verification = ? WHERE chat_id = ?')
+          .bind(false, true, targetChatId)
+          .run();
+      }
+
+      return { changed: true, isBlocked: blocked };
     }
 
     async function getOrCreateUserState(chatId) {
@@ -1229,32 +1442,15 @@ export default {
         }
 
         if (action === 'block') {
-          const isBlocked = await getUserBlockedState(privateChatId);
-          if (isBlocked) {
-            await sendMessageToTopic(topicId, `用户 ${privateChatId} 当前已被拉黑。`);
-          } else {
-            let state = await getOrCreateUserState(privateChatId);
-            state.is_blocked = true;
-            userStateCache.set(privateChatId, state);
-            await env.D1.prepare('UPDATE user_states SET is_blocked = ? WHERE chat_id = ?')
-              .bind(true, privateChatId)
-              .run();
-            await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
-          }
+          const result = await setUserBlockedState(privateChatId, true);
+          await sendMessageToTopic(topicId, result.changed
+            ? `用户 ${privateChatId} 已被拉黑，消息将不再转发。`
+            : `用户 ${privateChatId} 当前已被拉黑。`);
         } else if (action === 'unblock') {
-          const isBlocked = await getUserBlockedState(privateChatId);
-          if (!isBlocked) {
-            await sendMessageToTopic(topicId, `用户 ${privateChatId} 当前未被拉黑。`);
-          } else {
-            let state = await getOrCreateUserState(privateChatId);
-            state.is_blocked = false;
-            state.is_first_verification = true;
-            userStateCache.set(privateChatId, state);
-            await env.D1.prepare('UPDATE user_states SET is_blocked = ?, is_first_verification = ? WHERE chat_id = ?')
-              .bind(false, true, privateChatId)
-              .run();
-            await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
-          }
+          const result = await setUserBlockedState(privateChatId, false);
+          await sendMessageToTopic(topicId, result.changed
+            ? `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`
+            : `用户 ${privateChatId} 当前未被拉黑。`);
         } else if (action === 'toggle_verification') {
           const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
           const newState = !currentState;
@@ -1518,21 +1714,19 @@ export default {
       });
       const data = await response.json();
       if (!data.ok) {
+        const knownUser = await env.D1.prepare(
+          'SELECT username, nickname FROM known_users WHERE chat_id = ?'
+        )
+          .bind(chatId)
+          .first();
         userInfo = {
           id: chatId,
-          username: `User_${chatId}`,
-          nickname: `User_${chatId}`
+          username: knownUser?.username || `User_${chatId}`,
+          nickname: knownUser?.nickname || knownUser?.username || `User_${chatId}`
         };
       } else {
-        const result = data.result;
-        const nickname = result.first_name
-          ? `${result.first_name}${result.last_name ? ` ${result.last_name}` : ''}`.trim()
-          : result.username || `User_${chatId}`;
-        userInfo = {
-          id: result.id || chatId,
-          username: result.username || `User_${chatId}`,
-          nickname: nickname
-        };
+        userInfo = buildUserInfoFromTelegramUser(data.result, chatId);
+        await rememberKnownUser(userInfo);
       }
 
       userInfoCache.set(chatId, userInfo);
