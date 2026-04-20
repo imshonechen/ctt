@@ -598,15 +598,26 @@ export default {
       }
 
       const targetChatId = parts[1];
+      await resetUserState(targetChatId);
+      await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态和消息频率已重置，当前子话题将继续复用。`);
+    }
+
+    async function resetUserState(targetChatId) {
       await env.D1.batch([
         env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId),
-        env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId),
-        env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(targetChatId)
+        env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId)
       ]);
       userStateCache.set(targetChatId, undefined);
       messageRateCache.set(targetChatId, undefined);
+    }
+
+    async function removeUserTopicBinding(targetChatId, topicId) {
+      await env.D1.batch([
+        env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(targetChatId),
+        env.D1.prepare('DELETE FROM admin_panel_messages WHERE topic_id = ?').bind(topicId)
+      ]);
       topicIdCache.set(targetChatId, undefined);
-      await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
+      adminPanelCache.set(topicId, undefined);
     }
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
@@ -630,7 +641,10 @@ export default {
           { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
         ],
         [
-          { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
+          { text: '重置用户', callback_data: `reset_user_state_${privateChatId}` }
+        ],
+        [
+          { text: '删除用户并删除话题', callback_data: `delete_user_topic_${privateChatId}` }
         ]
       ];
 
@@ -813,6 +827,12 @@ export default {
       if (data.startsWith('verify_')) {
         action = 'verify';
         privateChatId = parts[1];
+      } else if (data.startsWith('reset_user_state_')) {
+        action = 'reset_user_state';
+        privateChatId = parts.slice(3).join('_');
+      } else if (data.startsWith('delete_user_topic_')) {
+        action = 'delete_user_topic';
+        privateChatId = parts.slice(3).join('_');
       } else if (data.startsWith('toggle_verification_')) {
         action = 'toggle_verification';
         privateChatId = parts.slice(2).join('_');
@@ -829,7 +849,7 @@ export default {
         action = 'unblock';
         privateChatId = parts.slice(1).join('_');
       } else if (data.startsWith('delete_user_')) {
-        action = 'delete_user';
+        action = 'legacy_delete_user';
         privateChatId = parts.slice(2).join('_');
       } else {
         action = data;
@@ -921,6 +941,8 @@ export default {
       } else {
         const senderId = callbackQuery.from.id.toString();
         const isAdmin = await checkIfAdmin(senderId);
+        let shouldRefreshAdminPanel = true;
+        let callbackNotice = '';
         if (!isAdmin) {
           await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
           await sendAdminPanel(chatId, topicId, privateChatId, messageId);
@@ -978,21 +1000,38 @@ export default {
           const newState = !currentState;
           await setSetting('user_raw_enabled', newState.toString());
           await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
-        } else if (action === 'delete_user') {
-          userStateCache.set(privateChatId, undefined);
-          messageRateCache.set(privateChatId, undefined);
-          topicIdCache.set(privateChatId, undefined);
-          await env.D1.batch([
-            env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
-            env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId),
-            env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId)
-          ]);
-          await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
+        } else if (action === 'reset_user_state') {
+          await resetUserState(privateChatId);
+          await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息频率已重置，当前子话题将继续复用。`);
+        } else if (action === 'delete_user_topic') {
+          await resetUserState(privateChatId);
+          try {
+            await deleteForumTopic(topicId);
+            await removeUserTopicBinding(privateChatId, topicId);
+            shouldRefreshAdminPanel = false;
+            callbackNotice = '已删除用户并删除当前子话题。';
+          } catch (error) {
+            await sendMessageToTopic(topicId, `删除当前子话题失败：${error.message}。已仅重置用户状态，当前子话题将继续保留。`);
+          }
+        } else if (action === 'legacy_delete_user') {
+          await sendMessageToTopic(topicId, '检测到旧版管理员面板按钮，请重新发送 /admin 打开新版面板后再操作。');
         } else {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
         }
 
-        await sendAdminPanel(chatId, topicId, privateChatId, messageId);
+        if (shouldRefreshAdminPanel) {
+          await sendAdminPanel(chatId, topicId, privateChatId, messageId);
+        }
+
+        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            callback_query_id: callbackQuery.id,
+            ...(callbackNotice ? { text: callbackNotice } : {})
+          })
+        });
+        return;
       }
 
       await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
@@ -1305,6 +1344,22 @@ export default {
       const data = await response.json();
       if (!data.ok) {
         throw new Error(`Failed to pin message: ${data.description}`);
+      }
+    }
+
+    async function deleteForumTopic(topicId) {
+      const requestBody = {
+        chat_id: GROUP_ID,
+        message_thread_id: topicId
+      };
+      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteForumTopic`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody)
+      });
+      const data = await response.json();
+      if (!data.ok) {
+        throw new Error(data.description || '未知错误');
       }
     }
 
