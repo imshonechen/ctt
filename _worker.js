@@ -576,14 +576,14 @@ export default {
         return;
       }
 
-      const senderLabel = buildTopicSenderLabel(userInfo, chatId);
+      const senderBadge = buildTopicSenderBadge(userInfo, chatId);
 
       try {
         if (text) {
-          const formattedMessage = `${senderLabel}\n${escapeHtml(text)}`;
+          const formattedMessage = `${senderBadge}\n${escapeHtml(text)}`;
           await sendMessageToTopic(topicId, formattedMessage, { parse_mode: 'HTML' });
         } else {
-          await sendMessageToTopic(topicId, senderLabel, {
+          await sendMessageToTopic(topicId, senderBadge, {
             parse_mode: 'HTML',
             disable_web_page_preview: true
           });
@@ -604,10 +604,10 @@ export default {
         }
 
         if (text) {
-          const formattedMessage = `${senderLabel}\n${escapeHtml(text)}`;
+          const formattedMessage = `${senderBadge}\n${escapeHtml(text)}`;
           await sendMessageToTopic(recreatedTopicId, formattedMessage, { parse_mode: 'HTML' });
         } else {
-          await sendMessageToTopic(recreatedTopicId, senderLabel, {
+          await sendMessageToTopic(recreatedTopicId, senderBadge, {
             parse_mode: 'HTML',
             disable_web_page_preview: true
           });
@@ -834,10 +834,26 @@ export default {
         .toLowerCase();
     }
 
+    function buildTelegramUserUrl(userInfo, chatId) {
+      if (hasPublicUsername(userInfo)) {
+        return `tg://resolve?domain=${encodeURIComponent(normalizeUsername(userInfo.username))}`;
+      }
+      return `tg://user?id=${encodeURIComponent(String(chatId))}`;
+    }
+
+    function buildTelegramUsernameLink(username) {
+      const resolvedUsername = String(username || '').trim().replace(/^@+/, '');
+      return `<a href="tg://resolve?domain=${encodeURIComponent(normalizeUsername(resolvedUsername))}">@${escapeHtml(resolvedUsername)}</a>`;
+    }
+
     function buildTopicSenderLabel(userInfo, chatId) {
       const userName = userInfo?.username || `User_${chatId}`;
       const nickname = escapeHtml(userInfo?.nickname || userName);
-      return `<a href="tg://user?id=${chatId}">${nickname}</a>`;
+      return `<a href="${buildTelegramUserUrl(userInfo, chatId)}">${nickname}</a>`;
+    }
+
+    function buildTopicSenderBadge(userInfo, chatId) {
+      return `【${buildTopicSenderLabel(userInfo, chatId)}】`;
     }
 
     async function buildResetUserNotice(chatId) {
@@ -1094,14 +1110,14 @@ export default {
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body: JSON.stringify(normalizeSendMessagePayload({
           chat_id: chatId,
           message_thread_id: topicId,
           text: adminMessage,
           parse_mode: 'HTML',
           disable_web_page_preview: true,
           reply_markup: { inline_keyboard: buttons }
-        })
+        }))
       });
       const data = await response.json();
       if (!data.ok) {
@@ -1475,11 +1491,7 @@ export default {
             ? (await Promise.all(
                 blockedUsers.results.map(async (row) => {
                   const userInfo = await getUserInfo(row.chat_id);
-                  const hasUsername = userInfo?.username && !userInfo.username.startsWith('User_');
-                  const nickname = escapeHtml(userInfo?.nickname || `User_${row.chat_id}`);
-                  const nicknameLabel = hasUsername
-                    ? `<a href="https://t.me/${userInfo.username}">${nickname}</a>`
-                    : nickname;
+                  const nicknameLabel = buildTopicSenderLabel(userInfo, row.chat_id);
                   return `${row.chat_id} | ${nicknameLabel}`;
                 })
               )).join('\n')
@@ -1778,7 +1790,7 @@ export default {
       };
       const nicknameLine = `昵称: ${buildTopicSenderLabel(topicUserInfo, userId)}`;
       const userNameLine = hasPublicUsername(topicUserInfo)
-        ? `用户名: <a href="https://t.me/${topicUserInfo.username}">@${escapeHtml(topicUserInfo.username)}</a>`
+        ? `用户名: ${buildTelegramUsernameLink(topicUserInfo.username)}`
         : '用户名: 未设置';
       const pinnedMessage = `${nicknameLine}\n${userNameLine}\nUserID: ${escapeHtml(userId)}\n发起时间: ${escapeHtml(formattedTime)}${safeNotificationContent ? `\n\n${escapeHtml(safeNotificationContent)}` : ''}`;
 
@@ -1834,17 +1846,37 @@ export default {
       adminPanelCache.set(topicId, messageId);
     }
 
+    function normalizeSendMessagePayload(payload) {
+      if (!payload || typeof payload !== 'object') {
+        return payload;
+      }
+
+      if (payload.disable_web_page_preview !== true) {
+        return payload;
+      }
+
+      return {
+        ...payload,
+        link_preview_options: {
+          ...(payload.link_preview_options && typeof payload.link_preview_options === 'object'
+            ? payload.link_preview_options
+            : {}),
+          is_disabled: true
+        }
+      };
+    }
+
     async function sendMessageToTopic(topicId, text, options = {}) {
       if (!text.trim()) {
         throw new Error('Message text is empty');
       }
 
-      const requestBody = {
+      const requestBody = normalizeSendMessagePayload({
         chat_id: GROUP_ID,
         text: text,
         message_thread_id: topicId,
         ...options
-      };
+      });
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
