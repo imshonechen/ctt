@@ -570,65 +570,59 @@ export default {
         return;
       }
 
-      let topicId = await ensureUserTopic(chatId, userInfo);
+      const topicId = await ensureUserTopic(chatId, userInfo);
       if (!topicId) {
         await sendMessageToUser(chatId, "无法创建话题，请稍后再试或联系管理员。");
         return;
       }
 
-      const isTopicValid = await validateTopic(topicId);
-      if (!isTopicValid) {
+      const senderLabel = buildTopicSenderLabel(userInfo, chatId);
+
+      try {
+        if (text) {
+          const formattedMessage = `${senderLabel}\n${escapeHtml(text)}`;
+          await sendMessageToTopic(topicId, formattedMessage, { parse_mode: 'HTML' });
+        } else {
+          await sendMessageToTopic(topicId, senderLabel, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+          });
+          await copyMessageToTopic(topicId, message);
+        }
+      } catch (error) {
+        if (!isTopicUnavailableError(error)) {
+          throw error;
+        }
+
         await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
         topicIdCache.set(chatId, undefined);
-        topicId = await ensureUserTopic(chatId, userInfo);
-        if (!topicId) {
+
+        const recreatedTopicId = await ensureUserTopic(chatId, userInfo);
+        if (!recreatedTopicId) {
           await sendMessageToUser(chatId, "无法重新创建话题，请稍后再试或联系管理员。");
           return;
         }
-      }
 
-      const senderLabel = buildTopicSenderLabel(userInfo, chatId);
-
-      if (text) {
-        const formattedMessage = `${senderLabel}\n${escapeHtml(text)}`;
-        await sendMessageToTopic(topicId, formattedMessage, { parse_mode: 'HTML' });
-      } else {
-        await sendMessageToTopic(topicId, senderLabel, {
-          parse_mode: 'HTML',
-          disable_web_page_preview: true
-        });
-        await copyMessageToTopic(topicId, message);
+        if (text) {
+          const formattedMessage = `${senderLabel}\n${escapeHtml(text)}`;
+          await sendMessageToTopic(recreatedTopicId, formattedMessage, { parse_mode: 'HTML' });
+        } else {
+          await sendMessageToTopic(recreatedTopicId, senderLabel, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+          });
+          await copyMessageToTopic(recreatedTopicId, message);
+        }
       }
     }
 
-    async function validateTopic(topicId) {
-      try {
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_thread_id: topicId,
-            text: "您有新消息！",
-            disable_notification: true
-          })
-        });
-        const data = await response.json();
-        if (data.ok) {
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: GROUP_ID,
-              message_id: data.result.message_id
-            })
-          });
-          return true;
-        }
-        return false;
-      } catch (error) {
-        return false;
-      }
+    function isTopicUnavailableError(error) {
+      const errorMessage = String(error?.message || '').toLowerCase();
+      return errorMessage.includes('message thread not found')
+        || errorMessage.includes('topic_closed')
+        || errorMessage.includes('topic deleted')
+        || errorMessage.includes('message thread')
+        || errorMessage.includes('forum topic');
     }
 
     async function ensureUserTopic(chatId, userInfo) {
@@ -843,10 +837,7 @@ export default {
     function buildTopicSenderLabel(userInfo, chatId) {
       const userName = userInfo?.username || `User_${chatId}`;
       const nickname = escapeHtml(userInfo?.nickname || userName);
-      if (hasPublicUsername(userInfo)) {
-        return `<a href="https://t.me/${userInfo.username}">${nickname}</a>`;
-      }
-      return nickname;
+      return `<a href="tg://user?id=${chatId}">${nickname}</a>`;
     }
 
     async function buildResetUserNotice(chatId) {
