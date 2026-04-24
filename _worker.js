@@ -836,14 +836,14 @@ export default {
 
     function buildTelegramUserUrl(userInfo, chatId) {
       if (hasPublicUsername(userInfo)) {
-        return `tg://resolve?domain=${encodeURIComponent(normalizeUsername(userInfo.username))}`;
+        return `tg://resolve?domain=${encodeURIComponent(normalizeUsername(userInfo.username))}&profile`;
       }
       return `tg://user?id=${encodeURIComponent(String(chatId))}`;
     }
 
     function buildTelegramUsernameLink(username) {
       const resolvedUsername = String(username || '').trim().replace(/^@+/, '');
-      return `<a href="tg://resolve?domain=${encodeURIComponent(normalizeUsername(resolvedUsername))}">@${escapeHtml(resolvedUsername)}</a>`;
+      return `<a href="tg://resolve?domain=${encodeURIComponent(normalizeUsername(resolvedUsername))}&profile">@${escapeHtml(resolvedUsername)}</a>`;
     }
 
     function buildTopicSenderLabel(userInfo, chatId) {
@@ -853,7 +853,7 @@ export default {
     }
 
     function buildTopicSenderBadge(userInfo, chatId) {
-      return `【${buildTopicSenderLabel(userInfo, chatId)}】`;
+      return `${buildTopicSenderLabel(userInfo, chatId)}:`;
     }
 
     async function buildResetUserNotice(chatId) {
